@@ -3,24 +3,22 @@ import json
 import asyncio
 import requests
 from xml.etree import ElementTree
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+import time
+import traceback
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+# Import OpenAI for embeddings
 from litellm import AsyncOpenAI
 
+# Import database functionality
 from db import init_collection
 
+# Load environment variables
 load_dotenv()
-
-# Initialize OpenAI client
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Initialize ChromaDB collection
-chroma_collection = init_collection()
 
 @dataclass
 class ProcessedChunk:
@@ -64,8 +62,8 @@ def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
 
     return chunks
 
-async def get_title_and_summary(chunk: str, url: str) -> Dict[str, str]:
-    """Extract title and summary using GPT-4."""
+async def get_title_and_summary(chunk: str, url: str, openai_client: AsyncOpenAI) -> Dict[str, str]:
+    """Extract title and summary using an LLM."""
     system_prompt = """You are an AI that extracts titles and summaries from web content chunks.
     Return a JSON object with 'title' and 'summary' keys.
     For the title: If this seems like the start of a document, extract its title. If it's a middle chunk, derive a descriptive title.
@@ -93,7 +91,7 @@ async def get_title_and_summary(chunk: str, url: str) -> Dict[str, str]:
             "summary": "Error processing summary",
         }
 
-async def get_embedding(text: str) -> List[float]:
+async def get_embedding(text: str, openai_client: AsyncOpenAI) -> List[float]:
     """Get embedding vector from OpenAI."""
     try:
         response = await openai_client.embeddings.create(
@@ -104,10 +102,10 @@ async def get_embedding(text: str) -> List[float]:
         print(f"Error getting embedding: {e}")
         return [0] * 1536
 
-async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChunk:
+async def process_chunk(chunk: str, chunk_number: int, url: str, openai_client: AsyncOpenAI) -> ProcessedChunk:
     """Process a single chunk of text."""
-    extracted = await get_title_and_summary(chunk, url)
-    embedding = await get_embedding(chunk)
+    extracted = await get_title_and_summary(chunk, url, openai_client)
+    embedding = await get_embedding(chunk, openai_client)
 
     metadata = {
         "source": urlparse(url).netloc,
@@ -127,15 +125,7 @@ async def process_chunk(chunk: str, chunk_number: int, url: str) -> ProcessedChu
         embedding=embedding,
     )
 
-async def process_and_store_document(url: str, markdown: str):
-    """Process a document and store its chunks in parallel."""
-    chunks = chunk_text(markdown)
-    tasks = [process_chunk(chunk, i, url) for i, chunk in enumerate(chunks)]
-    processed_chunks = await asyncio.gather(*tasks)
-    insert_tasks = [insert_chunk(chunk) for chunk in processed_chunks]
-    await asyncio.gather(*insert_tasks)
-
-async def insert_chunk(chunk: ProcessedChunk):
+async def insert_chunk(chunk: ProcessedChunk, chroma_collection):
     """Insert a processed chunk into ChromaDB."""
     try:
         chroma_collection.add(
@@ -156,46 +146,18 @@ async def insert_chunk(chunk: ProcessedChunk):
     except Exception as e:
         print(f"Error inserting chunk: {e}")
 
-async def crawl_parallel(urls: List[str], max_concurrent: int = 5):
-    """Crawl multiple URLs in parallel with a concurrency limit."""
-    print(f"Found {len(urls)} URLs to crawl")
-
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=False,
-        extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"],
-    )
-    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
-
-    crawler = AsyncWebCrawler(config=browser_config)
-    await crawler.start()
-
-    try:
-        semaphore = asyncio.Semaphore(max_concurrent)
-        total_urls = len(urls)
-        processed_urls = 0
-
-        async def process_url(url: str):
-            nonlocal processed_urls
-            async with semaphore:
-                result = await crawler.arun(
-                    url=url, config=crawl_config, session_id="session1"
-                )
-                if result.success:
-                    processed_urls += 1
-                    print(
-                        f"Successfully crawled: {url} ({processed_urls}/{total_urls})"
-                    )
-                    await process_and_store_document(
-                        url, result.markdown_v2.raw_markdown
-                    )
-                else:
-                    print(f"Failed: {url} - Error: {result.error_message}")
-
-        await asyncio.gather(*[process_url(url) for url in urls])
-        print(f"Completed crawling {processed_urls} out of {total_urls} URLs")
-    finally:
-        await crawler.close()
+async def process_and_store_document(url: str, content: str, openai_client: AsyncOpenAI, chroma_collection):
+    """Process a document and store its chunks."""
+    chunks = chunk_text(content)
+    print(f"Processing {len(chunks)} chunks for {url}")
+    
+    for i, chunk in enumerate(chunks):
+        try:
+            processed_chunk = await process_chunk(chunk, i, url, openai_client)
+            await insert_chunk(processed_chunk, chroma_collection)
+        except Exception as e:
+            print(f"Error processing chunk {i} for {url}: {e}")
+            traceback.print_exc()
 
 def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
     """Get URLs from a sitemap."""
@@ -212,3 +174,54 @@ def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
     except Exception as e:
         print(f"Error fetching sitemap: {e}")
         return []
+
+async def crawl_url(url: str, openai_client: AsyncOpenAI, chroma_collection):
+    """Crawl a single URL and process its content."""
+    try:
+        print(f"Crawling {url}...")
+        # Use requests for simple fetching instead of crawl4ai
+        response = requests.get(url)
+        response.raise_for_status()
+        content = response.text
+        
+        # Process the content as markdown for simplicity
+        await process_and_store_document(url, content, openai_client, chroma_collection)
+        return True
+    except Exception as e:
+        print(f"Error crawling {url}: {e}")
+        traceback.print_exc()
+        return False
+
+async def crawl_parallel(urls: List[str], openai_api_key: Optional[str] = None, max_concurrent: int = 3):
+    """Crawl multiple URLs in parallel with a concurrency limit."""
+    if not urls:
+        print("No URLs provided for crawling")
+        return
+    
+    print(f"Starting to crawl {len(urls)} URLs")
+    
+    # Initialize OpenAI client
+    api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("Error: OpenAI API key not provided")
+        return
+    
+    openai_client = AsyncOpenAI(api_key=api_key)
+    
+    # Initialize ChromaDB collection
+    chroma_collection = init_collection()
+    
+    # Set up semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_url(url):
+        async with semaphore:
+            return await crawl_url(url, openai_client, chroma_collection)
+    
+    # Process URLs in parallel with concurrency limit
+    tasks = [process_url(url) for url in urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Count successful crawls
+    successful = sum(1 for r in results if r is True)
+    print(f"Successfully crawled {successful} out of {len(urls)} URLs")
