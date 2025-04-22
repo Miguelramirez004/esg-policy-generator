@@ -3,42 +3,14 @@ import asyncio
 from dotenv import load_dotenv
 from litellm import AsyncOpenAI
 import os
-from crawl import crawl_parallel, get_urls_from_sitemap
-from db import init_collection
-from excel_utils import process_esg_parameters, validate_esg_parameters, create_parameter_template
 import pandas as pd
 from io import BytesIO
 import json
+import threading
+import nest_asyncio
 
 # Load environment variables
 load_dotenv()
-
-# Initialize OpenAI client and ChromaDB collection
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key and not st.secrets.get("OPENAI_API_KEY"):
-    st.error("OpenAI API key not found! Please set it in .env file or in Streamlit secrets.")
-    
-openai_client = AsyncOpenAI(
-    api_key=openai_api_key or st.secrets.get("OPENAI_API_KEY")
-)
-
-# Initialize ChromaDB collection
-collection = init_collection()
-
-# Initialize dependencies for the company profile agent
-from company_profile import (
-    CompanyProfileDeps,
-    retrieve_company_info,
-    extract_company_profile,
-    generate_esg_policies,
-    analyze_policy_alignment
-)
-
-# Create dependencies object
-deps = CompanyProfileDeps(
-    collection=collection,
-    openai_client=openai_client
-)
 
 # Set up Streamlit page configuration
 st.set_page_config(
@@ -47,13 +19,59 @@ st.set_page_config(
     layout="wide"
 )
 
+# Apply nest_asyncio to allow nested event loops
+nest_asyncio.apply()
+
+# Function to get API key from environment or secrets
+def get_openai_api_key():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key and hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    return api_key
+
+# Initialize OpenAI client
+def init_openai_client():
+    api_key = get_openai_api_key()
+    if not api_key:
+        st.error("OpenAI API key not found! Please set it in .env file or in Streamlit secrets.")
+        return None
+    return AsyncOpenAI(api_key=api_key)
+
+# Function to download ESG parameter template
 def download_template():
     """Create and return template Excel file."""
+    from excel_utils import create_parameter_template
     df = create_parameter_template()
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Sheet1', index=False)
     return buffer
+
+# Function to run an async function in a thread
+def run_async_in_thread(async_func, *args, **kwargs):
+    """Run an async function in a new thread and return the result."""
+    result_container = []
+    error_container = []
+    
+    def run_async():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(async_func(*args, **kwargs))
+            result_container.append(result)
+        except Exception as e:
+            error_container.append(e)
+        finally:
+            loop.close()
+    
+    thread = threading.Thread(target=run_async)
+    thread.start()
+    thread.join()
+    
+    if error_container:
+        raise error_container[0]
+    
+    return result_container[0] if result_container else None
 
 def main():
     st.title("Company Profile & ESG Policy Generator 🌱")
@@ -66,6 +84,11 @@ def main():
         "ESG Policies",
         "Alignment Analysis"
     ])
+    
+    # Check for API key
+    api_key = get_openai_api_key()
+    if not api_key:
+        st.sidebar.error("⚠️ OpenAI API key not found! Set it in Streamlit secrets or .env file.")
     
     # Crawler Tab
     with tab1:
@@ -90,29 +113,35 @@ def main():
         
         else:  # Sitemap URL
             sitemap_url = st.text_input("Enter Sitemap URL")
-            if sitemap_url:
-                if st.button("Load URLs from Sitemap"):
-                    urls_to_crawl = get_urls_from_sitemap(sitemap_url)
-                    st.write(f"Found {len(urls_to_crawl)} URLs in sitemap")
+            if sitemap_url and st.button("Load URLs from Sitemap"):
+                # Import here to avoid module-level import issues
+                from crawl import get_urls_from_sitemap
+                urls_to_crawl = get_urls_from_sitemap(sitemap_url)
+                st.write(f"Found {len(urls_to_crawl)} URLs in sitemap")
         
         if st.button("Start Crawling") and urls_to_crawl:
-            st.write(f"Starting to crawl {len(urls_to_crawl)} URLs...")
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # We need to define this as a non-async function because Streamlit
-            # doesn't support top-level await
-            def run_crawl():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(crawl_parallel(urls_to_crawl))
-                progress_bar.progress(100)
-                status_text.write("Crawling completed!")
-            
-            # Run in a thread to avoid blocking the UI
-            import threading
-            thread = threading.Thread(target=run_crawl)
-            thread.start()
+            if not api_key:
+                st.error("OpenAI API key is required for crawling")
+            else:
+                st.write(f"Starting to crawl {len(urls_to_crawl)} URLs...")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # Import crawl function here to avoid module-level import issues
+                from crawl import crawl_parallel
+                
+                # Define a function to run the crawl with a progress bar
+                def run_crawl():
+                    try:
+                        run_async_in_thread(crawl_parallel, urls_to_crawl, api_key)
+                        progress_bar.progress(100)
+                        status_text.write("Crawling completed!")
+                    except Exception as e:
+                        status_text.error(f"Error during crawling: {str(e)}")
+                
+                # Run in a thread to avoid blocking the UI
+                thread = threading.Thread(target=run_crawl)
+                thread.start()
     
     # ESG Parameters Tab
     with tab2:
@@ -136,6 +165,8 @@ def main():
         uploaded_file = st.file_uploader("Upload ESG Parameters", type=['xlsx'])
         
         if uploaded_file is not None:
+            # Import function here to avoid module-level import issues
+            from excel_utils import process_esg_parameters, validate_esg_parameters
             parameters = process_esg_parameters(uploaded_file)
             
             if parameters and validate_esg_parameters(parameters):
@@ -164,51 +195,62 @@ def main():
         st.header("Company Profile Analysis")
         
         if st.button("Extract Company Profile"):
-            # Check if documents have been crawled
-            doc_count = len(collection.get()["ids"]) if collection.get()["ids"] else 0
-            
-            if doc_count == 0:
-                st.warning("No documents in the database. Please crawl company website first.")
+            if not api_key:
+                st.error("OpenAI API key is required for profile extraction")
             else:
-                with st.spinner("Analyzing company information..."):
-                    # Define this as a non-async function because Streamlit
-                    # doesn't support top-level await
-                    def run_extraction():
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        profile = loop.run_until_complete(extract_company_profile(deps))
-                        return profile
-                    
-                    profile = run_extraction()
-                    
-                    # Store in session state
-                    st.session_state.company_profile = profile
-                    
-                    # Display company profile in an organized way
-                    if "error" not in profile:
-                        col1, col2 = st.columns(2)
+                # Import ChromaDB collection and CompanyProfileDeps
+                from db import init_collection
+                from company_profile import CompanyProfileDeps, extract_company_profile
+                
+                # Initialize dependencies
+                collection = init_collection()
+                openai_client = init_openai_client()
+                
+                # Check if documents have been crawled
+                doc_count = len(collection.get()["ids"]) if collection.get()["ids"] else 0
+                
+                if doc_count == 0:
+                    st.warning("No documents in the database. Please crawl company website first.")
+                else:
+                    with st.spinner("Analyzing company information..."):
+                        deps = CompanyProfileDeps(
+                            collection=collection,
+                            openai_client=openai_client
+                        )
                         
-                        with col1:
-                            st.subheader("Company Overview")
-                            st.write(profile.get("Company Overview", "Not available"))
+                        try:
+                            profile = run_async_in_thread(extract_company_profile, deps)
                             
-                            st.subheader("Mission")
-                            st.write(profile.get("Mission Statement", "Not available"))
+                            # Store in session state
+                            st.session_state.company_profile = profile
                             
-                            st.subheader("Vision")
-                            st.write(profile.get("Vision Statement", "Not available"))
-                        
-                        with col2:
-                            st.subheader("Core Values")
-                            st.write(profile.get("Core Values", "Not available"))
-                            
-                            st.subheader("Key Objectives")
-                            st.write(profile.get("Key Objectives", "Not available"))
-                        
-                        with st.expander("📚 Sources"):
-                            st.write(profile.get("Sources Used", "Not available"))
-                    else:
-                        st.error(profile["error"])
+                            # Display company profile in an organized way
+                            if "error" not in profile:
+                                col1, col2 = st.columns(2)
+                                
+                                with col1:
+                                    st.subheader("Company Overview")
+                                    st.write(profile.get("Company Overview", "Not available"))
+                                    
+                                    st.subheader("Mission")
+                                    st.write(profile.get("Mission Statement", "Not available"))
+                                    
+                                    st.subheader("Vision")
+                                    st.write(profile.get("Vision Statement", "Not available"))
+                                
+                                with col2:
+                                    st.subheader("Core Values")
+                                    st.write(profile.get("Core Values", "Not available"))
+                                    
+                                    st.subheader("Key Objectives")
+                                    st.write(profile.get("Key Objectives", "Not available"))
+                                
+                                with st.expander("📚 Sources"):
+                                    st.write(profile.get("Sources Used", "Not available"))
+                            else:
+                                st.error(profile["error"])
+                        except Exception as e:
+                            st.error(f"Error extracting company profile: {str(e)}")
     
     # ESG Policies Tab
     with tab4:
@@ -219,21 +261,35 @@ def main():
         elif "esg_parameters" not in st.session_state:
             st.warning("Please upload ESG parameters first.")
         elif st.button("Generate ESG Policies"):
-            with st.spinner("Generating ESG policies..."):
-                # Define as a non-async function
-                def run_policy_generation():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    policies = loop.run_until_complete(generate_esg_policies(
-                        deps, 
-                        st.session_state.company_profile,
-                        st.session_state.esg_parameters
-                    ))
-                    return policies
+            if not api_key:
+                st.error("OpenAI API key is required for policy generation")
+            else:
+                # Import necessary components
+                from db import init_collection
+                from company_profile import CompanyProfileDeps, generate_esg_policies
                 
-                policies = run_policy_generation()
-                st.session_state.generated_policies = policies
-                st.markdown(policies)
+                with st.spinner("Generating ESG policies..."):
+                    # Initialize dependencies again
+                    collection = init_collection()
+                    openai_client = init_openai_client()
+                    
+                    deps = CompanyProfileDeps(
+                        collection=collection,
+                        openai_client=openai_client
+                    )
+                    
+                    try:
+                        policies = run_async_in_thread(
+                            generate_esg_policies,
+                            deps, 
+                            st.session_state.company_profile,
+                            st.session_state.esg_parameters
+                        )
+                        
+                        st.session_state.generated_policies = policies
+                        st.markdown(policies)
+                    except Exception as e:
+                        st.error(f"Error generating ESG policies: {str(e)}")
     
     # Alignment Analysis Tab
     with tab5:
@@ -243,20 +299,34 @@ def main():
             "generated_policies" not in st.session_state):
             st.warning("Please generate company profile and ESG policies first.")
         elif st.button("Analyze Alignment"):
-            with st.spinner("Analyzing policy alignment..."):
-                # Define as a non-async function
-                def run_alignment_analysis():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    alignment = loop.run_until_complete(analyze_policy_alignment(
-                        deps,
-                        st.session_state.company_profile,
-                        st.session_state.generated_policies
-                    ))
-                    return alignment
+            if not api_key:
+                st.error("OpenAI API key is required for alignment analysis")
+            else:
+                # Import necessary components
+                from db import init_collection
+                from company_profile import CompanyProfileDeps, analyze_policy_alignment
                 
-                alignment = run_alignment_analysis()
-                st.markdown(alignment)
+                with st.spinner("Analyzing policy alignment..."):
+                    # Initialize dependencies again
+                    collection = init_collection()
+                    openai_client = init_openai_client()
+                    
+                    deps = CompanyProfileDeps(
+                        collection=collection,
+                        openai_client=openai_client
+                    )
+                    
+                    try:
+                        alignment = run_async_in_thread(
+                            analyze_policy_alignment,
+                            deps,
+                            st.session_state.company_profile,
+                            st.session_state.generated_policies
+                        )
+                        
+                        st.markdown(alignment)
+                    except Exception as e:
+                        st.error(f"Error analyzing policy alignment: {str(e)}")
 
     # Sidebar
     with st.sidebar:
@@ -274,10 +344,12 @@ def main():
         
         st.header("Statistics")
         try:
+            from db import init_collection
+            collection = init_collection()
             doc_count = len(collection.get()["ids"])
             st.metric("Documents in Database", doc_count)
         except Exception as e:
-            st.error(f"Error getting document count: {e}")
+            st.error(f"Error getting document count: {str(e)}")
         
         # Add GitHub link
         st.markdown("---")
