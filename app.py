@@ -167,47 +167,80 @@ def main():
         st.header("ESG Parameters Configuration")
         
         st.write("""
-        Upload an Excel file containing ESG parameters. The file should have a sheet named 'Sheet1' 
-        with Invest Europe Table 7 format.
+        Upload an Excel file containing ESG parameters. The file should include these columns: 
+        - Policy (required)
+        - Scope
+        - Components
+        - Targets
+        - Timeline
         """)
         
         # Template download
-        if st.button("Download Template"):
-            buffer = download_template()
-            st.download_button(
-                label="Download ESG Parameters Template",
-                data=buffer.getvalue(),
-                file_name="esg_parameters_template.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            if st.button("Download Template"):
+                buffer = download_template()
+                st.download_button(
+                    label="Download ESG Parameters Template",
+                    data=buffer.getvalue(),
+                    file_name="esg_parameters_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
         
-        uploaded_file = st.file_uploader("Upload ESG Parameters", type=['xlsx'])
+        # Debugging toggle
+        with col2:
+            show_debug = st.checkbox("Show detailed debugging information")
+        
+        # File upload section
+        uploaded_file = st.file_uploader("Upload ESG Parameters", type=['xlsx', 'xls'])
         
         if uploaded_file is not None:
+            # Create an expander for debugging info if checked
+            if show_debug:
+                with st.expander("Excel Processing Debug Info", expanded=True):
+                    st.write("Processing Excel file...")
+            
             # Import function here to avoid module-level import issues
             from excel_utils import process_esg_parameters, validate_esg_parameters
-            parameters = process_esg_parameters(uploaded_file)
             
+            # Process with debugging info shown/hidden based on checkbox
+            if show_debug:
+                parameters = process_esg_parameters(uploaded_file)
+            else:
+                # Capture and redirect output temporarily
+                with st.spinner("Processing Excel file..."):
+                    # Create a placeholder for potential errors
+                    error_placeholder = st.empty()
+                    # Process without showing debug info
+                    parameters = process_esg_parameters(uploaded_file)
+            
+            # Validate parameters
             if parameters and validate_esg_parameters(parameters):
                 st.session_state.esg_parameters = parameters
                 st.success("ESG parameters successfully loaded!")
                 
                 # Display parameters in an organized way
+                categories_found = []
                 for category, params in parameters.items():
-                    with st.expander(f"📋 {category} Parameters"):
-                        for param_name, param_data in params.items():
-                            st.write(f"**{param_name}**")
-                            st.write(f"Value: {param_data['value']}")
-                            
-                            # Display description fields
-                            st.write("Description:")
-                            for key, value in param_data['description'].items():
-                                if value:
-                                    st.write(f"- {key}: {value}")
-                            
-                            st.write("---")
+                    if params:  # Only show categories with parameters
+                        categories_found.append(category)
+                        with st.expander(f"📋 {category} Parameters ({len(params)} policies)"):
+                            for param_name, param_data in params.items():
+                                st.write(f"**{param_name}**")
+                                
+                                # Display description fields
+                                st.write("Details:")
+                                for key, value in param_data['description'].items():
+                                    if value:
+                                        st.write(f"- {key}: {value}")
+                                
+                                st.write("---")
+                
+                # Confirm which categories were found
+                st.write(f"Found parameters for these categories: {', '.join(categories_found)}")
             else:
-                st.error("Invalid parameter file format. Please use the template.")
+                st.error("Invalid parameter file format or missing required categories. The file must contain at least one policy for each ESG category (Environmental, Social, Governance).")
+                st.info("Please check your Excel file structure and make sure it has columns for Policy, Scope, Components, Targets, and Timeline. Use the template for guidance.")
     
     # Company Profile Tab
     with tab3:
@@ -376,7 +409,7 @@ def main():
         
         # Add version info
         st.markdown("---")
-        st.caption("Version 1.1 - SQLite Compatibility Fix")
+        st.caption("Version 1.2 - Excel Template Compatibility Fix")
 
 if __name__ == "__main__":
     main()
