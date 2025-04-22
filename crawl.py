@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 import time
 import traceback
+from bs4 import BeautifulSoup
 
 # Import OpenAI for embeddings
 from litellm import AsyncOpenAI
@@ -146,9 +147,43 @@ async def insert_chunk(chunk: ProcessedChunk, chroma_collection):
     except Exception as e:
         print(f"Error inserting chunk: {e}")
 
-async def process_and_store_document(url: str, content: str, openai_client: AsyncOpenAI, chroma_collection):
+def html_to_markdown(html_content: str) -> str:
+    """Convert HTML to a simplified markdown-like format."""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Remove scripts, styles
+    for script in soup(["script", "style"]):
+        script.extract()
+    
+    # Get text and add some markdown-like formatting
+    text = soup.get_text(separator='\n')
+    
+    # Find headings and make them markdown
+    for heading in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        level = int(heading.name[1])
+        heading_text = heading.get_text().strip()
+        if heading_text:
+            text = text.replace(heading_text, f"{'#' * level} {heading_text}")
+    
+    # Find links
+    for link in soup.find_all('a'):
+        link_text = link.get_text().strip()
+        href = link.get('href')
+        if link_text and href:
+            text = text.replace(link_text, f"[{link_text}]({href})")
+    
+    # Clean up extra whitespace
+    text = '\n'.join(line.strip() for line in text.split('\n') if line.strip())
+    
+    return text
+
+async def process_and_store_document(url: str, html_content: str, openai_client: AsyncOpenAI, chroma_collection):
     """Process a document and store its chunks."""
-    chunks = chunk_text(content)
+    # Convert HTML to markdown-like text
+    markdown_content = html_to_markdown(html_content)
+    
+    # Split into chunks
+    chunks = chunk_text(markdown_content)
     print(f"Processing {len(chunks)} chunks for {url}")
     
     for i, chunk in enumerate(chunks):
@@ -179,13 +214,14 @@ async def crawl_url(url: str, openai_client: AsyncOpenAI, chroma_collection):
     """Crawl a single URL and process its content."""
     try:
         print(f"Crawling {url}...")
-        # Use requests for simple fetching instead of crawl4ai
-        response = requests.get(url)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
-        content = response.text
         
-        # Process the content as markdown for simplicity
-        await process_and_store_document(url, content, openai_client, chroma_collection)
+        # Process the HTML content
+        await process_and_store_document(url, response.text, openai_client, chroma_collection)
         return True
     except Exception as e:
         print(f"Error crawling {url}: {e}")
