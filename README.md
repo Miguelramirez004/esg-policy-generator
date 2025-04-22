@@ -64,6 +64,24 @@ streamlit run app.py
 4. **ESG Policies Tab**: Generate ESG policies based on the profile and parameters
 5. **Alignment Analysis Tab**: Analyze the alignment between company values and policies
 
+## Technical Implementation
+
+This application uses:
+- **Streamlit**: For the user interface
+- **ChromaDB**: For vector database storage of document chunks
+- **OpenAI**: For embeddings and LLM-based text generation
+- **BeautifulSoup**: For HTML parsing and content extraction
+- **Pandas**: For Excel file processing
+- **Asyncio**: For asynchronous processing with proper event loop handling
+
+## Troubleshooting
+
+If you encounter issues with deployment:
+
+1. Check the Streamlit Cloud logs for specific error messages
+2. Ensure your secrets are correctly configured
+3. Verify that your OpenAI API key has access to the models used
+
 ## Data Storage
 
 The application uses ChromaDB to store document embeddings locally. The database is stored in a `chroma_db` directory in the application root.
