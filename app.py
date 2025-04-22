@@ -73,6 +73,21 @@ def run_async_in_thread(async_func, *args, **kwargs):
     
     return result_container[0] if result_container else None
 
+# Function to get document count safely
+def get_document_count(collection):
+    """Get the number of documents in the collection, handling different storage backends."""
+    try:
+        # Check which storage backend we're using (flag set in db.py)
+        if st.session_state.get('using_chromadb', False):
+            # For ChromaDB
+            return len(collection.get()["ids"])
+        else:
+            # For our simple storage fallback
+            return collection.count()
+    except Exception as e:
+        st.sidebar.warning(f"Error counting documents: {str(e)}")
+        return 0
+
 def main():
     st.title("Company Profile & ESG Policy Generator 🌱")
     
@@ -89,6 +104,10 @@ def main():
     api_key = get_openai_api_key()
     if not api_key:
         st.sidebar.error("⚠️ OpenAI API key not found! Set it in Streamlit secrets or .env file.")
+    
+    # Initialize the database collection
+    from db import init_collection
+    collection = init_collection()
     
     # Crawler Tab
     with tab1:
@@ -198,16 +217,14 @@ def main():
             if not api_key:
                 st.error("OpenAI API key is required for profile extraction")
             else:
-                # Import ChromaDB collection and CompanyProfileDeps
-                from db import init_collection
+                # Import CompanyProfileDeps
                 from company_profile import CompanyProfileDeps, extract_company_profile
                 
                 # Initialize dependencies
-                collection = init_collection()
                 openai_client = init_openai_client()
                 
                 # Check if documents have been crawled
-                doc_count = len(collection.get()["ids"]) if collection.get()["ids"] else 0
+                doc_count = get_document_count(collection)
                 
                 if doc_count == 0:
                     st.warning("No documents in the database. Please crawl company website first.")
@@ -265,12 +282,10 @@ def main():
                 st.error("OpenAI API key is required for policy generation")
             else:
                 # Import necessary components
-                from db import init_collection
                 from company_profile import CompanyProfileDeps, generate_esg_policies
                 
                 with st.spinner("Generating ESG policies..."):
                     # Initialize dependencies again
-                    collection = init_collection()
                     openai_client = init_openai_client()
                     
                     deps = CompanyProfileDeps(
@@ -303,12 +318,10 @@ def main():
                 st.error("OpenAI API key is required for alignment analysis")
             else:
                 # Import necessary components
-                from db import init_collection
                 from company_profile import CompanyProfileDeps, analyze_policy_alignment
                 
                 with st.spinner("Analyzing policy alignment..."):
                     # Initialize dependencies again
-                    collection = init_collection()
                     openai_client = init_openai_client()
                     
                     deps = CompanyProfileDeps(
@@ -344,18 +357,26 @@ def main():
         
         st.header("Statistics")
         try:
-            from db import init_collection
-            collection = init_collection()
-            doc_count = len(collection.get()["ids"])
+            doc_count = get_document_count(collection)
             st.metric("Documents in Database", doc_count)
+            
+            # Show storage backend info
+            if st.session_state.get('using_chromadb', False):
+                st.success("Using ChromaDB for document storage")
+            else:
+                st.info("Using simple document storage (ChromaDB not available)")
         except Exception as e:
-            st.error(f"Error getting document count: {str(e)}")
+            st.error(f"Error getting statistics: {str(e)}")
         
         # Add GitHub link
         st.markdown("---")
         st.markdown(
             "[![GitHub](https://img.shields.io/badge/GitHub-Repository-blue?style=for-the-badge&logo=github)](https://github.com/Miguelramirez004/esg-policy-generator)"
         )
+        
+        # Add version info
+        st.markdown("---")
+        st.caption("Version 1.1 - SQLite Compatibility Fix")
 
 if __name__ == "__main__":
     main()
