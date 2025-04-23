@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 import threading
 import nest_asyncio
+import time
 
 # Load environment variables
 load_dotenv()
@@ -138,29 +139,102 @@ def main():
                 urls_to_crawl = get_urls_from_sitemap(sitemap_url)
                 st.write(f"Found {len(urls_to_crawl)} URLs in sitemap")
         
-        if st.button("Start Crawling") and urls_to_crawl:
-            if not api_key:
-                st.error("OpenAI API key is required for crawling")
-            else:
-                st.write(f"Starting to crawl {len(urls_to_crawl)} URLs...")
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+        # Crawl button and status
+        if urls_to_crawl:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                crawl_button = st.button("Start Crawling")
+            with col2:
+                max_concurrent = st.number_input("Max Concurrent", min_value=1, max_value=5, value=2)
                 
-                # Import crawl function here to avoid module-level import issues
-                from crawl import crawl_parallel
+            # Progress indicators
+            progress_container = st.empty()
+            status_container = st.empty()
+            details_container = st.empty()
+            
+            # Use session state to track crawl status between reruns
+            if 'crawl_running' not in st.session_state:
+                st.session_state.crawl_running = False
+                st.session_state.crawl_status = None
+                st.session_state.crawl_start_time = None
                 
-                # Define a function to run the crawl with a progress bar
-                def run_crawl():
+            # Function to start crawling in a separate process
+            def start_crawl():
+                if not api_key:
+                    status_container.error("OpenAI API key is required for crawling")
+                    return
+                
+                st.session_state.crawl_running = True
+                st.session_state.crawl_start_time = time.time()
+                
+                # Import run_crawl_sync function here to avoid circular imports
+                from crawl import run_crawl_sync
+                
+                # Run the crawl in a separate thread without updating UI elements from it
+                def run_in_thread():
                     try:
-                        run_async_in_thread(crawl_parallel, urls_to_crawl, api_key)
-                        progress_bar.progress(100)
-                        status_text.write("Crawling completed!")
+                        status = run_crawl_sync(urls_to_crawl, api_key, max_concurrent)
+                        st.session_state.crawl_status = status
                     except Exception as e:
-                        status_text.error(f"Error during crawling: {str(e)}")
+                        print(f"Error in crawl thread: {str(e)}")
+                    finally:
+                        st.session_state.crawl_running = False
                 
-                # Run in a thread to avoid blocking the UI
-                thread = threading.Thread(target=run_crawl)
+                thread = threading.Thread(target=run_in_thread)
+                thread.daemon = True  # Allow the thread to be terminated when app closes
                 thread.start()
+            
+            # Start crawling if button clicked
+            if crawl_button and not st.session_state.crawl_running:
+                start_crawl()
+                # Force a rerun to start showing progress
+                st.experimental_rerun()
+            
+            # Show crawling progress
+            if st.session_state.crawl_running or st.session_state.crawl_status:
+                # Calculate elapsed time
+                elapsed = time.time() - (st.session_state.crawl_start_time or time.time())
+                elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+                
+                if st.session_state.crawl_running:
+                    status_container.info(f"Crawling in progress... (Elapsed: {elapsed_str})")
+                
+                # Get current status
+                status = st.session_state.crawl_status
+                
+                if status:
+                    # Update progress bar
+                    progress = status.get_progress_percentage()
+                    progress_container.progress(int(progress))
+                    
+                    # Show status details
+                    if status.is_complete:
+                        if status.successful_urls > 0:
+                            status_container.success(f"Crawling completed! Processed {status.processed_urls} URLs with {status.successful_urls} successful.")
+                        else:
+                            status_container.error(f"Crawling completed but with errors. {status.failed_urls} failed URLs.")
+                    else:
+                        status_container.info(f"Processed: {status.processed_urls}/{status.total_urls} URLs ({progress:.1f}%) - Elapsed: {elapsed_str}")
+                    
+                    # Show details
+                    details_md = f"""
+                    **Crawl Details:**
+                    - Total URLs: {status.total_urls}
+                    - Successful: {status.successful_urls}
+                    - Failed: {status.failed_urls}
+                    """
+                    
+                    if status.last_processed_url:
+                        details_md += f"- Last URL: `{status.last_processed_url}`\n"
+                    
+                    if status.last_error:
+                        details_md += f"- Last error: `{status.last_error}`\n"
+                        
+                    details_container.markdown(details_md)
+                else:
+                    # No status yet, but crawling is running
+                    progress_container.progress(0)
+                    status_container.info(f"Starting crawl process... (Elapsed: {elapsed_str})")
     
     # ESG Parameters Tab
     with tab2:
@@ -409,7 +483,7 @@ def main():
         
         # Add version info
         st.markdown("---")
-        st.caption("Version 1.2 - Excel Template Compatibility Fix")
+        st.caption("Version 1.3 - Crawler Function & Excel Template Compatibility Fix")
 
 if __name__ == "__main__":
     main()
