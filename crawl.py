@@ -3,7 +3,7 @@ import json
 import asyncio
 import requests
 from xml.etree import ElementTree
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -14,9 +14,6 @@ from bs4 import BeautifulSoup
 
 # Import OpenAI for embeddings
 from litellm import AsyncOpenAI
-
-# Import database functionality
-from db import init_collection
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +27,23 @@ class ProcessedChunk:
     content: str
     metadata: Dict[str, Any]
     embedding: List[float]
+
+@dataclass
+class CrawlStatus:
+    """Track the status of a crawl operation."""
+    total_urls: int = 0
+    processed_urls: int = 0
+    successful_urls: int = 0
+    failed_urls: int = 0
+    is_complete: bool = False
+    last_error: Optional[str] = None
+    last_processed_url: Optional[str] = None
+    
+    def get_progress_percentage(self) -> float:
+        """Get the crawl progress as a percentage."""
+        if self.total_urls == 0:
+            return 0.0
+        return min(100.0, (self.processed_urls / self.total_urls) * 100.0)
 
 def chunk_text(text: str, chunk_size: int = 5000) -> List[str]:
     """Split text into chunks, respecting code blocks and paragraphs."""
@@ -210,10 +224,12 @@ def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
         print(f"Error fetching sitemap: {e}")
         return []
 
-async def crawl_url(url: str, openai_client: AsyncOpenAI, chroma_collection):
+async def crawl_url(url: str, openai_client: AsyncOpenAI, chroma_collection, status: CrawlStatus):
     """Crawl a single URL and process its content."""
     try:
         print(f"Crawling {url}...")
+        status.last_processed_url = url
+        
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
@@ -222,27 +238,58 @@ async def crawl_url(url: str, openai_client: AsyncOpenAI, chroma_collection):
         
         # Process the HTML content
         await process_and_store_document(url, response.text, openai_client, chroma_collection)
+        
+        # Update status
+        status.successful_urls += 1
+        status.processed_urls += 1
         return True
     except Exception as e:
-        print(f"Error crawling {url}: {e}")
+        error_msg = f"Error crawling {url}: {str(e)}"
+        print(error_msg)
+        status.last_error = error_msg
+        status.failed_urls += 1
+        status.processed_urls += 1
         traceback.print_exc()
         return False
 
-async def crawl_parallel(urls: List[str], openai_api_key: Optional[str] = None, max_concurrent: int = 3):
-    """Crawl multiple URLs in parallel with a concurrency limit."""
+async def crawl_parallel(
+    urls: List[str], 
+    openai_api_key: Optional[str] = None, 
+    max_concurrent: int = 3,
+    status_callback: Optional[Callable[[CrawlStatus], None]] = None
+) -> CrawlStatus:
+    """
+    Crawl multiple URLs in parallel with a concurrency limit.
+    
+    Args:
+        urls: List of URLs to crawl
+        openai_api_key: OpenAI API key
+        max_concurrent: Maximum number of concurrent requests
+        status_callback: Optional callback function to receive status updates
+        
+    Returns:
+        CrawlStatus object with final crawl results
+    """
     if not urls:
         print("No URLs provided for crawling")
-        return
+        return CrawlStatus()
     
+    # Create and initialize status object
+    status = CrawlStatus(total_urls=len(urls))
     print(f"Starting to crawl {len(urls)} URLs")
     
     # Initialize OpenAI client
     api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("Error: OpenAI API key not provided")
-        return
+        status.last_error = "OpenAI API key not provided"
+        status.is_complete = True
+        return status
     
     openai_client = AsyncOpenAI(api_key=api_key)
+    
+    # Import here to avoid circular imports
+    from db import init_collection
     
     # Initialize ChromaDB collection
     chroma_collection = init_collection()
@@ -252,12 +299,41 @@ async def crawl_parallel(urls: List[str], openai_api_key: Optional[str] = None, 
     
     async def process_url(url):
         async with semaphore:
-            return await crawl_url(url, openai_client, chroma_collection)
+            result = await crawl_url(url, openai_client, chroma_collection, status)
+            # Call status callback if provided
+            if status_callback:
+                try:
+                    status_callback(status)
+                except Exception as e:
+                    print(f"Error in status callback: {e}")
+            return result
     
     # Process URLs in parallel with concurrency limit
     tasks = [process_url(url) for url in urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Count successful crawls
-    successful = sum(1 for r in results if r is True)
-    print(f"Successfully crawled {successful} out of {len(urls)} URLs")
+    # Update final status
+    status.is_complete = True
+    if status_callback:
+        try:
+            status_callback(status)
+        except Exception as e:
+            print(f"Error in final status callback: {e}")
+    
+    print(f"Crawl completed: {status.successful_urls} successful, {status.failed_urls} failed out of {status.total_urls} URLs")
+    return status
+
+# Simple synchronous function for calling from non-async code
+def run_crawl_sync(
+    urls: List[str], 
+    openai_api_key: Optional[str] = None, 
+    max_concurrent: int = 3
+) -> CrawlStatus:
+    """Synchronous wrapper for crawl_parallel."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        status = loop.run_until_complete(crawl_parallel(urls, openai_api_key, max_concurrent))
+        return status
+    finally:
+        loop.close()
